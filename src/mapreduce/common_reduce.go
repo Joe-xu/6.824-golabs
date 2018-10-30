@@ -57,7 +57,7 @@ func doReduce(
 
 	bucket := make(map[string][]string) // [key]values
 
-	outF, err := os.OpenFile(outFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0755)
+	outF, err := os.OpenFile(outFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("doReduce: %s", err)
 	}

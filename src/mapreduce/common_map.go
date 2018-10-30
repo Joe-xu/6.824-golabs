@@ -84,7 +84,7 @@ func doMap(
 	for _, kv := range kvs {
 		r := ihash(kv.Key) % nReduce
 		fName := reduceName(jobName, mapTask, r)
-		outF, err := os.OpenFile(filepath.Join(IntermediateDir, fName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0755)
+		outF, err := os.OpenFile(filepath.Join(IntermediateDir, fName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
 		if err != nil {
 			log.Fatalf("doMap: %s", err)
 		}
