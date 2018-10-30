@@ -1,8 +1,22 @@
 package mapreduce
 
 import (
+	"encoding/json"
 	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"os"
+	"path/filepath"
 )
+
+const IntermediateDir = "./"
+
+func init() {
+	err := os.MkdirAll(IntermediateDir, os.ModeDir|os.ModePerm)
+	if err != nil {
+		log.Fatalf("mkdir for intermediate files: %s", err)
+	}
+}
 
 func doMap(
 	jobName string, // the name of the MapReduce job
@@ -53,6 +67,34 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+
+	inF, err := os.Open(inFile)
+	if err != nil {
+		log.Fatalf("doMap: %s", err)
+	}
+	defer inF.Close()
+
+	content, err := ioutil.ReadAll(inF)
+	if err != nil {
+		log.Fatalf("doMap: %s", err)
+	}
+
+	kvs := mapF(inF.Name(), string(content))
+
+	for _, kv := range kvs {
+		r := ihash(kv.Key) % nReduce
+		fName := reduceName(jobName, mapTask, r)
+		outF, err := os.OpenFile(filepath.Join(IntermediateDir, fName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0755)
+		if err != nil {
+			log.Fatalf("doMap: %s", err)
+		}
+
+		outEnc := json.NewEncoder(outF)
+		outEnc.Encode(&kv)
+
+		outF.Close()
+	}
+
 }
 
 func ihash(s string) int {

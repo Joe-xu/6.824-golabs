@@ -1,5 +1,15 @@
 package mapreduce
 
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +54,73 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	bucket := make(map[string][]string) // [key]values
+
+	outF, err := os.OpenFile(outFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0755)
+	if err != nil {
+		log.Fatalf("doReduce: %s", err)
+	}
+	defer outF.Close()
+
+	outEnc := json.NewEncoder(outF)
+
+	for m := 0; m < nMap; m++ {
+
+		kv := new(KeyValue)
+		fpath := filepath.Join(IntermediateDir, reduceName(jobName, m, reduceTask))
+		err := readIntermediaFile(fpath, func(line []byte) error {
+
+			json.Unmarshal(line, kv)
+			bucket[kv.Key] = append(bucket[kv.Key], kv.Value)
+
+			return nil
+		})
+
+		if err != nil {
+			log.Fatalf("doReduce: %s", err)
+		}
+
+	}
+
+	// sort
+	sortedKey := make([]string, 0, len(bucket))
+	for k := range bucket {
+		sortedKey = append(sortedKey, k)
+	}
+	sort.Strings(sortedKey)
+
+	// output
+	for _, k := range sortedKey {
+		v := reduceF(k, bucket[k])
+		err := outEnc.Encode(&KeyValue{k, v})
+		if err != nil {
+			log.Fatalf("doReduce: %s", err)
+		}
+	}
+
+}
+
+func readIntermediaFile(fpath string, onLine func(line []byte) error) error {
+
+	inF, err := os.Open(fpath)
+	if err != nil {
+		return fmt.Errorf("readIntermediaFile: %s", err)
+	}
+	defer inF.Close()
+
+	bufIn := bufio.NewScanner(inF)
+	for bufIn.Scan() {
+
+		line := bufIn.Bytes()
+
+		err := onLine(line)
+		if err != nil {
+			return err
+		}
+
+	}
+
+	return bufIn.Err()
+
 }
