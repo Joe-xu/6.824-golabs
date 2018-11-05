@@ -17,13 +17,15 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -55,6 +57,28 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	currentLeader int // peer's index, and -1 mean null
+	currentTerm   int
+	votedFor      int   // peer's index, and -1 mean null
+	log           []Log // start from 1
+
+	// volatile state
+	commitIndex int
+	lastApplied int // index
+
+	applyCh         chan ApplyMsg
+	heartbeatNoticy chan struct{}
+	stepDownNoticy  chan struct{} // turn into follower
+
+	// only for leader
+	nextIndex  []int // next log entry index to send
+	matchIndex []int
+}
+
+type Log struct {
+	logIdx  int // start from 1
+	term    int
+	content string
 }
 
 // return currentTerm and whether this server
@@ -64,9 +88,15 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.currentTerm
+	isleader = rf.currentLeader == rf.me
+
 	return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +113,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,15 +136,17 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+
+	Term         int
+	CandidateId  int // peer's index
+	LastLogIndex int // index of log array
+	LastLogTerm  int
 }
 
 //
@@ -124,6 +155,9 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -131,6 +165,29 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+
+	if rf.currentTerm > args.Term {
+		// reject
+		reply.VoteGranted = false
+		return
+	}
+
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+
+		if rf.commitIndex <= args.LastLogIndex && rf.log[rf.commitIndex].term <= args.LastLogTerm {
+			reply.VoteGranted = true
+			return
+		}
+	}
+
+	reply.VoteGranted = false
+	return
+
 }
 
 //
@@ -167,6 +224,48 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+
+	Entries []Log
+
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// reject
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	}
+
+	// TODO: more logic
+
+	// update election timeout
+	rf.heartbeatNoticy <- struct{}{}
+	reply.Success = true
+
+	return
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -188,7 +287,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -223,9 +321,145 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = make([]Log, 1, 10)
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.applyCh = applyCh
+	defer rf.runAsFollower()
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-
 	return rf
+}
+
+func (rf *Raft) waitForElection() {
+	for {
+
+		timeout := time.Millisecond * time.Duration(rand.Intn(200)+300)
+		timer := time.NewTicker(timeout)
+
+		select {
+		case <-rf.heartbeatNoticy:
+			timer.Stop()
+			timeout = time.Millisecond * time.Duration(rand.Intn(200)+300)
+		case <-timer.C:
+			rf.startNewElection()
+		}
+	}
+}
+
+func (rf *Raft) startNewElection() {
+
+	replys := make([]RequestVoteReply, len(rf.peers))
+
+	rf.mu.Lock()
+	req := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: rf.log[len(rf.log)-1].logIdx,
+		LastLogTerm:  rf.log[len(rf.log)-1].term,
+	}
+	rf.mu.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(len(rf.peers) - 1)
+	callSuccessNum := 1 // include itself
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(i int) {
+
+			ok := rf.sendRequestVote(i, req, &replys[i])
+			if ok {
+				callSuccessNum++
+			}
+			wg.Done()
+		}(i)
+
+	}
+
+	// summery
+	wg.Wait()
+	voteCount := 1 // include itself
+	for i, reply := range replys {
+		if i == rf.me {
+			continue
+		}
+
+		if reply.VoteGranted {
+			voteCount++
+		}
+	}
+
+	//  if get the majority vote
+	voteRate := float32(voteCount) / float32(callSuccessNum)
+	if voteRate > 0.5 {
+		rf.mu.Lock()
+		rf.currentLeader = rf.me
+		rf.currentTerm++
+		rf.mu.Unlock()
+
+		// start to send heartbeat
+		go rf.runAsLeader()
+	}
+
+}
+
+func (rf *Raft) sendHeartBeat() {
+
+	timer := time.NewTicker(1 * time.Second)
+	defer timer.Stop()
+	for {
+
+		select {
+		case <-rf.stepDownNoticy:
+			return
+		case <-timer.C:
+
+			rf.mu.Lock()
+			req := &AppendEntriesArgs{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+				Entries:  make([]Log, 0),
+				// LeaderCommit: ,
+			}
+			rf.mu.Unlock()
+
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+
+				// with best effort
+				go func(i int) {
+					rf.sendAppendEntries(i, req, nil)
+				}(i)
+
+			}
+
+		}
+
+	}
+}
+
+func (rf *Raft) runAsLeader() {
+
+	// some init work
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	rf.sendHeartBeat()
+}
+
+func (rf *Raft) runAsFollower() {
+
+	rf.waitForElection()
+
 }
