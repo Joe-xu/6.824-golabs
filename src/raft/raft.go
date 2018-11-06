@@ -19,6 +19,7 @@ package raft
 
 import (
 	"labrpc"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -76,9 +77,9 @@ type Raft struct {
 }
 
 type Log struct {
-	logIdx  int // start from 1
-	term    int
-	content string
+	LogIdx  int // start from 1
+	Term    int
+	Content string
 }
 
 // return currentTerm and whether this server
@@ -166,6 +167,8 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
+	rf.heartbeatNoticy <- struct{}{}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -177,9 +180,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	if rf.votedFor == -1 && rf.currentTerm != args.Term ||
+		rf.votedFor == args.CandidateId {
 
-		if rf.commitIndex <= args.LastLogIndex && rf.log[rf.commitIndex].term <= args.LastLogTerm {
+		if rf.commitIndex <= args.LastLogIndex && rf.log[rf.commitIndex].Term <= args.LastLogTerm {
+			log.Printf("N[%d]T[%d] grant vote for N[%d]T[%d]",
+				rf.me, rf.currentTerm, args.CandidateId, args.Term)
+			rf.votedFor = args.CandidateId
+			rf.currentTerm = args.Term
 			reply.VoteGranted = true
 			return
 		}
@@ -246,14 +254,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// reject
+
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
+	rf.currentTerm = args.Term
+	rf.currentLeader = args.LeaderId
 
 	// TODO: more logic
 
 	// update election timeout
+	log.Printf("N[%d]T[%d] heartbeat from N[%d]T[%d]", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 	rf.heartbeatNoticy <- struct{}{}
 	reply.Success = true
 
@@ -299,6 +311,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	log.Printf("N[%d]T[%d] killed", rf.me, rf.currentTerm)
 }
 
 //
@@ -321,6 +337,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 
+	rf.currentLeader = -1
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]Log, 1, 10)
@@ -329,6 +346,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 
 	rf.applyCh = applyCh
+	rf.stepDownNoticy = make(chan struct{}, 5)
+	rf.heartbeatNoticy = make(chan struct{}, 5)
 	defer rf.runAsFollower()
 
 	// initialize from state persisted before a crash
@@ -338,17 +357,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) waitForElection() {
+
+	timeout := time.Millisecond * time.Duration(rand.Intn(200)+250)
 	for {
 
-		timeout := time.Millisecond * time.Duration(rand.Intn(200)+300)
 		timer := time.NewTicker(timeout)
 
 		select {
 		case <-rf.heartbeatNoticy:
 			timer.Stop()
-			timeout = time.Millisecond * time.Duration(rand.Intn(200)+300)
+			timeout = time.Millisecond * time.Duration(rand.Intn(200)+500)
 		case <-timer.C:
+			timer.Stop()
+			log.Printf(" timeout")
 			rf.startNewElection()
+			return
 		}
 	}
 }
@@ -358,16 +381,18 @@ func (rf *Raft) startNewElection() {
 	replys := make([]RequestVoteReply, len(rf.peers))
 
 	rf.mu.Lock()
+	log.Printf("N[%d]T[%d] new elec", rf.me, rf.currentTerm)
+	rf.currentTerm++
+	rf.votedFor = rf.me
 	req := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: rf.log[len(rf.log)-1].logIdx,
-		LastLogTerm:  rf.log[len(rf.log)-1].term,
+		LastLogIndex: rf.log[len(rf.log)-1].LogIdx,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	rf.mu.Unlock()
 
-	var wg sync.WaitGroup
-	wg.Add(len(rf.peers) - 1)
+	done := make(chan struct{}, len(rf.peers))
 	callSuccessNum := 1 // include itself
 	for i := range rf.peers {
 		if i == rf.me {
@@ -380,18 +405,50 @@ func (rf *Raft) startNewElection() {
 			if ok {
 				callSuccessNum++
 			}
-			wg.Done()
+			done <- struct{}{}
 		}(i)
 
 	}
 
 	// summery
-	wg.Wait()
+	doneCnt := 0
+	for {
+		select {
+		case <-rf.heartbeatNoticy:
+			// turn into follower
+			// log.Print("turn into follower")
+			rf.runAsFollower()
+			return
+		case <-done:
+			doneCnt++
+
+			if doneCnt >= len(rf.peers)-1 {
+				// all vote return
+				// do summery
+				rf.handleVoteResult(replys, callSuccessNum)
+				return
+			}
+		}
+	}
+
+}
+
+func (rf *Raft) handleVoteResult(replys []RequestVoteReply, callSuccessNum int) {
 	voteCount := 1 // include itself
 	for i, reply := range replys {
 		if i == rf.me {
 			continue
 		}
+
+		// turn into follower
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.mu.Unlock()
+			rf.runAsFollower()
+			return
+		}
+		rf.mu.Unlock()
 
 		if reply.VoteGranted {
 			voteCount++
@@ -400,26 +457,39 @@ func (rf *Raft) startNewElection() {
 
 	//  if get the majority vote
 	voteRate := float32(voteCount) / float32(callSuccessNum)
+	log.Printf("N[%d] %d/%d (%d) in T[%d]", rf.me, voteCount, callSuccessNum, len(rf.peers), rf.currentTerm)
+	if voteRate == 0.5 {
+		// split vote
+		log.Printf("N[%d] split vote in T[%d]", rf.me, rf.currentTerm)
+		time.Sleep(time.Duration(rand.Intn(150)+150) * time.Millisecond)
+		rf.startNewElection()
+		return
+	}
 	if voteRate > 0.5 {
+		log.Printf("N[%d] become leader with %f in T[%d]", rf.me, voteRate, rf.currentTerm)
+
 		rf.mu.Lock()
 		rf.currentLeader = rf.me
-		rf.currentTerm++
+		rf.votedFor = -1
 		rf.mu.Unlock()
 
 		// start to send heartbeat
-		go rf.runAsLeader()
+		rf.runAsLeader()
+		return
 	}
 
+	rf.runAsFollower()
 }
 
 func (rf *Raft) sendHeartBeat() {
 
-	timer := time.NewTicker(1 * time.Second)
+	timer := time.NewTicker(150 * time.Millisecond)
 	defer timer.Stop()
 	for {
 
 		select {
 		case <-rf.stepDownNoticy:
+			log.Printf("leader %d stepdown", rf.me)
 			return
 		case <-timer.C:
 
@@ -439,7 +509,8 @@ func (rf *Raft) sendHeartBeat() {
 
 				// with best effort
 				go func(i int) {
-					rf.sendAppendEntries(i, req, nil)
+
+					rf.sendAppendEntries(i, req, &AppendEntriesReply{})
 				}(i)
 
 			}
@@ -455,11 +526,16 @@ func (rf *Raft) runAsLeader() {
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
-	rf.sendHeartBeat()
+	go rf.sendHeartBeat()
 }
 
 func (rf *Raft) runAsFollower() {
 
-	rf.waitForElection()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.votedFor = -1
+	// log.Printf("N[%d]T[%d] as follower", rf.me, rf.currentTerm)
+
+	go rf.waitForElection()
 
 }
