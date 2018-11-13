@@ -46,8 +46,8 @@ type ApplyMsg struct {
 }
 
 const (
-	minElectionTimeout    = 210
-	electionRandtimeRange = 100
+	minElectionTimeout    = 200
+	electionRandtimeRange = 200
 	heartbeatInterval     = 150
 )
 
@@ -87,9 +87,9 @@ type Raft struct {
 
 	signalCh chan Signal
 
-	updateElecTimeoutNoticy chan Signal // keep being follower
-	stepDownNoticy          chan Signal // leader turn into follower
-	cancelElecNoticy        chan Signal // candidate turn into follower
+	resetElecTimeoutNoticy chan Signal // keep being follower
+	stepDownNoticy         chan Signal // leader turn into follower
+	cancelElecNoticy       chan Signal // candidate turn into follower
 
 	// only for leader
 	nextIndex  []int // next log entry index to send
@@ -200,8 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.signalCh <- requestVoteSignal
 
-	if rf.votedFor == -1 && rf.currentTerm != args.Term ||
-		rf.votedFor == args.CandidateId {
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 
 		if rf.commitIndex <= args.LastLogIndex && rf.log[rf.commitIndex].Term <= args.LastLogTerm {
 
@@ -209,6 +208,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 			log.Printf("N[%d]T[%d] grant vote for N[%d]T[%d]",
 				rf.me, rf.currentTerm, args.CandidateId, args.Term)
+			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			return
@@ -277,16 +277,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	// reject
 
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
 
+	rf.signalCh <- heartbeatSignal
+
 	if rf.currentLeader == rf.me {
 		rf.signalCh <- stepDownSignal
 	}
-
-	rf.signalCh <- heartbeatSignal
 
 	log.Printf("N[%d]T[%d] heartbeat from N[%d]T[%d]", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 	rf.votedFor = -1
@@ -295,7 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// TODO: more logic
 
-	// update election timeout
+	reply.Term = rf.currentTerm
 	reply.Success = true
 
 	return
@@ -378,9 +379,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.signalCh = make(chan Signal, 50)
 
-	rf.stepDownNoticy = make(chan Signal, 5)
-	rf.updateElecTimeoutNoticy = make(chan Signal, 5)
-	rf.cancelElecNoticy = make(chan Signal, 5)
+	rf.stepDownNoticy = make(chan Signal, 10)
+	rf.resetElecTimeoutNoticy = make(chan Signal, 10)
+	rf.cancelElecNoticy = make(chan Signal, 10)
 
 	go rf.signalRouter()
 	defer rf.runAsFollower()
@@ -409,16 +410,15 @@ func (rf *Raft) signalRouter() {
 			case requestVoteSignal:
 				// do nothing
 
+				tryToSend(rf.resetElecTimeoutNoticy, sig)
 			case voteGrantSignal:
-				tryToSend(rf.updateElecTimeoutNoticy, sig)
 			case heartbeatSignal:
 
 				tryToSend(rf.cancelElecNoticy, sig)
-				tryToSend(rf.updateElecTimeoutNoticy, sig)
+				tryToSend(rf.resetElecTimeoutNoticy, sig)
 			case stepDownSignal:
 
 				tryToSend(rf.stepDownNoticy, sig)
-
 			}
 
 		}(sig)
@@ -434,7 +434,7 @@ func (rf *Raft) waitForElection() {
 		timer := time.NewTicker(timeout)
 
 		select {
-		case <-rf.updateElecTimeoutNoticy:
+		case <-rf.resetElecTimeoutNoticy:
 			timer.Stop()
 			timeout = time.Millisecond * time.Duration(rand.Intn(electionRandtimeRange)+minElectionTimeout)
 		case <-timer.C:
@@ -483,9 +483,24 @@ func (rf *Raft) startNewElection() {
 
 	totalCnt := 1
 	callSuccessNum := 1 // include itself
+	t := 1000 * time.Millisecond
+	timeout := time.NewTicker(t)
+	defer timeout.Stop()
 WAIT_VOTE:
 	for {
 		select {
+		case <-timeout.C:
+
+			go func() {
+				for range done {
+				}
+			}()
+
+			log.Printf("N[%d] wait vote timeout", rf.me)
+			go rf.runAsCandidate()
+
+			return
+
 		case <-rf.cancelElecNoticy:
 
 			go func() {
